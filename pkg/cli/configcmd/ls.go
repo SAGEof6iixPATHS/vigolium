@@ -2,6 +2,7 @@ package configcmd
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ func newLsCmd(deps Deps, example string) *cobra.Command {
 		Use:     "ls [filter]",
 		Aliases: []string{"list", "view"},
 		Short:   "Display current configuration",
-		Long:    "Display current configuration settings. Optionally filter by key (substring or fuzzy subsequence match, e.g. \"store\" matches \"storage.*\").",
+		Long:    "Display current configuration settings. Optionally filter by key (substring or fuzzy subsequence match, e.g. \"store\" matches \"storage.*\"). Filters containing glob metacharacters (* ? [ ]) are matched as glob patterns against the full key or any dot-segment, e.g. \"kno*\" matches \"known_issue_scan.*\".",
 		Example: example,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runConfigLs(deps, args)
@@ -47,7 +48,7 @@ func runConfigLs(deps Deps, args []string) error {
 	force := deps.Force()
 	count := 0
 	for _, entry := range entries {
-		if filter != "" && !fuzzyMatchKey(strings.ToLower(entry.Key), filter) {
+		if filter != "" && !keyMatches(strings.ToLower(entry.Key), filter) {
 			continue
 		}
 
@@ -82,6 +83,48 @@ func runConfigLs(deps Deps, args []string) error {
 	}
 
 	return nil
+}
+
+// keyMatches reports whether filter selects key. A filter containing glob
+// metacharacters (* ? [ ]) is treated as a glob pattern; anything else falls
+// back to the substring / fuzzy-subsequence match. A malformed glob pattern
+// also falls back to fuzzy matching so a stray bracket never silently hides
+// every key. Both inputs must already be lowercased.
+func keyMatches(key, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	if strings.ContainsAny(filter, "*?[") {
+		if matched, err := globMatchKey(key, filter); err == nil {
+			return matched
+		}
+	}
+	return fuzzyMatchKey(key, filter)
+}
+
+// globMatchKey reports whether a path.Match-style glob pattern matches the full
+// key or any single dot-segment. Keys never contain '/', so '*' matches any run
+// of characters (including dots): "kno*" matches the key "known_issue_scan.x"
+// directly and the segment "known_issue_scan" inside "scanning_pace.known_issue_scan.y".
+// err is non-nil only when the pattern itself is malformed.
+func globMatchKey(key, pattern string) (bool, error) {
+	matched, err := path.Match(pattern, key)
+	if err != nil {
+		return false, err
+	}
+	if matched {
+		return true, nil
+	}
+	for _, segment := range strings.Split(key, ".") {
+		matched, err := path.Match(pattern, segment)
+		if err != nil {
+			return false, err
+		}
+		if matched {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // fuzzyMatchKey reports whether filter matches key as a substring, or as an

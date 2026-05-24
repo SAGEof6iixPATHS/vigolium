@@ -53,6 +53,11 @@ spidering:
 
 known_issue_scan:
   enrich_targets: true
+  # Balanced intensity: only critical+high templates, keeping the phase fast and
+  # high-signal. Widen with: vigolium config set known_issue_scan.severities "critical,high,medium,low,info"
+  severities:
+    - critical
+    - high
   exclude_tags:
     - dos
 

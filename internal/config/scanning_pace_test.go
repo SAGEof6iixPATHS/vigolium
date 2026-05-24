@@ -211,6 +211,34 @@ func TestDefaultScanningPaceConfig(t *testing.T) {
 	}
 }
 
+// TestDefaultPace_EveryPhaseHasFiniteBudget pins the resolved max_duration each
+// phase gets from the shipped default config (45m base). Every scan/network
+// phase must resolve a non-zero, finite budget — a zero here means an unbounded
+// phase, the class of bug that let known-issue-scan overrun its limit. Update the
+// expected values deliberately if the default factors change.
+func TestDefaultPace_EveryPhaseHasFiniteBudget(t *testing.T) {
+	cfg := DefaultScanningPaceConfig()
+
+	want := map[string]time.Duration{
+		"discovery":          22*time.Minute + 30*time.Second, // 45m * 0.5
+		"spidering":          4*time.Minute + 30*time.Second,  // 45m * 0.1
+		"known-issue-scan":   45 * time.Minute,                // 45m * 1.0
+		"external_harvester": 4*time.Minute + 30*time.Second,  // 45m * 0.1
+		"dynamic-assessment": 45 * time.Minute,                // 45m * 1.0
+	}
+
+	for phase, expected := range want {
+		resolved := cfg.ResolvePhase(phase)
+		if resolved.MaxDuration <= 0 {
+			t.Errorf("phase %q resolved to an unbounded max_duration (%v)", phase, resolved.MaxDuration)
+			continue
+		}
+		if resolved.MaxDuration != expected {
+			t.Errorf("phase %q: resolved max_duration = %v, want %v", phase, resolved.MaxDuration, expected)
+		}
+	}
+}
+
 func TestValidate_ValidConfig(t *testing.T) {
 	cfg := &ScanningPaceConfig{
 		Concurrency: 50,

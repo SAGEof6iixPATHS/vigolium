@@ -58,6 +58,13 @@ spidering:
 
 known_issue_scan:
   enrich_targets: true
+  # Deep intensity: sweep every severity (the slower, exhaustive pass).
+  severities:
+    - critical
+    - high
+    - medium
+    - low
+    - info
   exclude_tags:
     - dos
 

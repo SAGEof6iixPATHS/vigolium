@@ -41,6 +41,14 @@ discovery:
 
 known_issue_scan:
   enrich_targets: false
+  # Quick intensity: critical+high only (matches balanced; never broader). Set
+  # explicitly because the profile overlay otherwise resets severities to empty
+  # (= all), which would make quick slower/wider than balanced. The lite strategy
+  # normally skips this phase entirely; this keeps it correct when forced on
+  # (e.g. `vigolium run known-issue-scan --intensity quick`).
+  severities:
+    - critical
+    - high
   exclude_tags:
     - dos
 

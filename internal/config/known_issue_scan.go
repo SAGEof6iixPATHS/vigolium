@@ -14,8 +14,16 @@ type KnownIssueScanConfig struct {
 }
 
 // DefaultKnownIssueScanConfig returns default known-issue scan configuration.
+//
+// Severities defaults to critical+high only: at the default (balanced) intensity
+// the known-issue scan focuses on high-signal findings rather than enumerating
+// every info/low template, which keeps the phase within its time budget. Operators
+// who want the full sweep can widen it with:
+//
+//	vigolium config set known_issue_scan.severities "critical,high,medium,low,info"
 func DefaultKnownIssueScanConfig() *KnownIssueScanConfig {
 	return &KnownIssueScanConfig{
+		Severities:    []string{"critical", "high"},
 		ExcludeTags:   []string{"dos"},
 		EnrichTargets: true,
 	}

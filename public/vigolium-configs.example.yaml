@@ -1022,12 +1022,13 @@ known_issue_scan:
 
   # Filter templates by severity (empty = all severities).
   # Options: critical, high, medium, low, info
-  # Default: [] (all severities)
-  severities: []
-  # Example: only run critical and high severity templates:
-  # severities:
-  #   - critical
-  #   - high
+  # Default: [critical, high] at the balanced intensity — high-signal only, which
+  # keeps the phase within its time budget. (The deep intensity sweeps all five.)
+  # Widen to the full sweep with:
+  #   vigolium config set known_issue_scan.severities "critical,high,medium,low,info"
+  severities:
+    - critical
+    - high
 
   # Custom nuclei templates directory.
   # Leave empty to use the default nuclei-templates location.

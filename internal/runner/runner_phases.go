@@ -518,13 +518,48 @@ func (r *Runner) buildInfrastructure() (*phaseInfra, error) {
 // runDiscoveryPhase ingests all input into the database without running modules.
 // It combines the original input source with deparos content discovery (if enabled),
 // expanding deparos targets with hosts discovered by prior phases (ExternalHarvest, Spidering).
+// phaseDeadline derives a phase-scoped context bounded by maxDuration so a phase
+// cannot run past its configured scanning_pace max_duration. It is the single
+// chokepoint for the "wrap the WHOLE phase, not just one leg" invariant that
+// known-issue-scan once regressed on (the Nuclei leg was bounded but the
+// Kingfisher leg ran on the raw ctx). When maxDuration <= 0 the phase is
+// unbounded: the parent ctx is returned unchanged with a no-op cancel so callers
+// can always `defer cancel()`. When the parent already has an earlier deadline
+// (e.g. the overall scan budget), context.WithTimeout keeps that earlier
+// deadline, so a phase can never extend the scan.
+func phaseDeadline(ctx context.Context, maxDuration time.Duration) (context.Context, context.CancelFunc) {
+	if maxDuration <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, maxDuration)
+}
+
+// coversAllSeverities reports whether the configured severity list already
+// includes every nuclei severity level, so the "widen the filter" tip can be
+// suppressed. Order- and duplicate-insensitive; inputs are normalized.
+func coversAllSeverities(sevs []string) bool {
+	want := map[string]bool{"critical": true, "high": true, "medium": true, "low": true, "info": true}
+	have := make(map[string]bool, len(sevs))
+	for _, s := range sevs {
+		have[strings.ToLower(strings.TrimSpace(s))] = true
+	}
+	for s := range want {
+		if !have[s] {
+			return false
+		}
+	}
+	return true
+}
+
 // runKnownIssueScanPhase orchestrates nuclei + kingfisher batch scanning.
 func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) error {
 	phaseStart := time.Now()
 
 	r.printPhaseStart("KnownIssueScan", "assess security posture with Nuclei templates and third-party validation checks")
+	var kisMaxDuration time.Duration
 	if r.settings != nil {
 		knownIssueScanPace := r.settings.ScanningPace.ResolvePhase("known-issue-scan")
+		kisMaxDuration = knownIssueScanPace.MaxDuration
 		if knownIssueScanPace.MaxDuration > 0 || knownIssueScanPace.DurationFactor > 0 {
 			detail := "Speed:"
 			if knownIssueScanPace.MaxDuration > 0 {
@@ -536,6 +571,23 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 			r.printPhaseDetail(detail)
 		}
 	}
+
+	// bookkeepingCtx is the un-bounded parent context (still cancelled if the
+	// whole scan is cancelled). End-of-phase DB writes use it so progress counters
+	// still land when only the phase deadline — not the scan — has fired.
+	bookkeepingCtx := ctx
+
+	// Enforce the known-issue-scan phase deadline across BOTH the Nuclei scan and
+	// the Kingfisher secret-scan batch below. knownissuescan.Run wraps its own
+	// ctx with cfg.Timeout, but runKingfisherBatch runs on the raw phase ctx — one
+	// binary invocation per response body in the DB. Without this wrap the
+	// Kingfisher loop lets total phase time blow past max_duration (mirrors the
+	// dynamic-assessment phase deadline wrap). The two legs share this single
+	// budget sequentially: a slow Nuclei run leaves Kingfisher less time (or none),
+	// which is surfaced as a curtailment notice rather than an error below.
+	var phaseCancel context.CancelFunc
+	ctx, phaseCancel = phaseDeadline(ctx, kisMaxDuration)
+	defer phaseCancel()
 	enrichTargets := true
 	if r.settings != nil {
 		enrichTargets = r.settings.KnownIssueScan.EnrichTargets
@@ -543,6 +595,18 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 	if !enrichTargets && !r.options.Silent {
 		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
 			terminal.TipPrefix(), terminal.Gray("enrich KnownIssueScan targets with discovered paths via"), terminal.HiCyan("vigolium config known_issue_scan.enrich_targets=true"))
+	}
+	// Surface the active severity filter and how to widen it. An empty list means
+	// "all severities", so only hint when the configured set does not already
+	// cover all five (the default balanced intensity ships with critical+high).
+	if r.settings != nil && !r.options.Silent {
+		sevs := r.settings.KnownIssueScan.Severities
+		if len(sevs) > 0 && !coversAllSeverities(sevs) {
+			fmt.Fprintf(os.Stderr, "  %s %s %s\n",
+				terminal.TipPrefix(),
+				terminal.Gray(fmt.Sprintf("known-issue-scan limited to %s severities; scan all via", strings.Join(sevs, ","))),
+				terminal.HiCyan(`vigolium config set known_issue_scan.severities "critical,high,medium,low,info"`))
+		}
 	}
 	r.printTargetDetail(r.formatTargetCounts(ctx, len(r.options.Targets)))
 	if r.repository != nil && r.options.Verbose {
@@ -573,14 +637,25 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 		}
 	}
 
-	// Nuclei scan on distinct hosts
+	// Nuclei scan on distinct hosts. A ctx error means the phase max_duration
+	// (or the scan) elapsed — that is a curtailment, not a failure.
 	if err := r.runKnownIssueScan(ctx, onResult); err != nil {
-		zap.L().Error("KnownIssueScan: Nuclei scan failed", zap.Error(err))
+		if ctx.Err() != nil {
+			zap.L().Warn("KnownIssueScan: Nuclei scan stopped at phase max_duration", zap.Error(ctx.Err()))
+		} else {
+			zap.L().Error("KnownIssueScan: Nuclei scan failed", zap.Error(err))
+		}
 	}
 
-	// Kingfisher batch scan on all response bodies
+	// Kingfisher batch scan on all response bodies. Shares the phase budget with
+	// the Nuclei leg above, so a slow Nuclei run can leave it little or no time;
+	// distinguish that curtailment from a genuine scanner failure.
 	if err := r.runKingfisherBatch(ctx, infra, onResult); err != nil {
-		zap.L().Error("KnownIssueScan: Kingfisher batch failed", zap.Error(err))
+		if ctx.Err() != nil {
+			zap.L().Warn("KnownIssueScan: Kingfisher secret scan curtailed before all response bodies were scanned — phase max_duration reached", zap.Error(ctx.Err()))
+		} else {
+			zap.L().Error("KnownIssueScan: Kingfisher batch failed", zap.Error(err))
+		}
 	}
 
 	// Print summary
@@ -592,9 +667,11 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 		r.printPhaseDetail(formatKnownIssueScanSummary(counts, total))
 	}
 
-	// Increment processed_count for KnownIssueScan phase
+	// Increment processed_count for KnownIssueScan phase. Use the un-bounded
+	// parent ctx so the counter still updates when the phase deadline fired
+	// mid-scan (findings were already written; only the budget is exhausted).
 	if r.repository != nil && total > 0 {
-		if err := r.repository.IncrementProcessedCount(ctx, infra.scanUUID, int64(total)); err != nil {
+		if err := r.repository.IncrementProcessedCount(bookkeepingCtx, infra.scanUUID, int64(total)); err != nil {
 			zap.L().Warn("KnownIssueScan: failed to increment processed count", zap.Error(err))
 		}
 	}
@@ -844,11 +921,9 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	// Enforce dynamic-assessment phase deadline across all feedback rounds. Without this wrap
 	// each round's executor would start a fresh timeout, letting total phase time
 	// reach feedbackRounds × daMaxDuration.
-	if daMaxDuration > 0 {
-		var phaseCancel context.CancelFunc
-		ctx, phaseCancel = context.WithTimeout(ctx, daMaxDuration)
-		defer phaseCancel()
-	}
+	var phaseCancel context.CancelFunc
+	ctx, phaseCancel = phaseDeadline(ctx, daMaxDuration)
+	defer phaseCancel()
 
 	// Reset cursor so dynamic-assessment reads all records from the beginning
 	// (seed phase advances the cursor past all records when saving them).

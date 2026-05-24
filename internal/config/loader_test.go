@@ -2,8 +2,43 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+// TestKnownIssueScanSeveritiesByIntensity pins the per-intensity known-issue-scan
+// severity filter. The default (balanced) ships critical+high only so the phase
+// stays within its time budget; deep sweeps all severities. Because the profile
+// overlay round-trips through YAML, a profile that omits `severities` resets the
+// field to empty (= all) — so EVERY bundled profile that has a known_issue_scan
+// block MUST set severities explicitly (including quick.yaml, the fastest tier,
+// which must never end up broader than balanced). This test guards that wiring.
+func TestKnownIssueScanSeveritiesByIntensity(t *testing.T) {
+	// Out-of-the-box default (plain `vigolium scan`, no profile).
+	if got := DefaultSettings().KnownIssueScan.Severities; !reflect.DeepEqual(got, []string{"critical", "high"}) {
+		t.Errorf("default KnownIssueScan.Severities = %v, want [critical high]", got)
+	}
+
+	cases := map[string][]string{
+		"quick":    {"critical", "high"},                          // --intensity quick
+		"standard": {"critical", "high"},                          // --intensity balanced
+		"full":     {"critical", "high", "medium", "low", "info"}, // --intensity deep
+	}
+	for name, want := range cases {
+		settings := DefaultSettings()
+		profile, err := LoadProfile(filepath.Join("..", "..", "public", "presets", "profiles", name+".yaml"))
+		if err != nil {
+			t.Fatalf("LoadProfile(%s): %v", name, err)
+		}
+		if err := ApplyProfile(settings, profile); err != nil {
+			t.Fatalf("ApplyProfile(%s): %v", name, err)
+		}
+		if got := settings.KnownIssueScan.Severities; !reflect.DeepEqual(got, want) {
+			t.Errorf("profile %q: KnownIssueScan.Severities = %v, want %v", name, got, want)
+		}
+	}
+}
 
 func TestExpandEnvVars(t *testing.T) {
 	const testVar = "VIGOLIUM_TEST_EXPAND_VAR"

@@ -76,12 +76,19 @@ func Run(ctx context.Context, cfg Config) error {
 	// Build engine options
 	opts := buildEngineOptions(ctx, cfg, scanLogger)
 
+	// Log the active severity filter (empty = all) so the narrowing is visible in
+	// both CLI and server logs, not only via the CLI-only console tip.
+	loggedSeverities := cfg.Severities
+	if len(loggedSeverities) == 0 {
+		loggedSeverities = []string{"all"}
+	}
 	zap.L().Info("Starting known-issue scan",
 		zap.Int("targets", len(cfg.Targets)),
 		zap.Int("concurrency", cfg.Concurrency),
 		zap.Int("rate_limit", cfg.RateLimit),
 		zap.Strings("tags", cfg.Tags),
 		zap.Strings("exclude_tags", cfg.ExcludeTags),
+		zap.Strings("severities", loggedSeverities),
 		zap.Duration("timeout", cfg.Timeout),
 	)
 
