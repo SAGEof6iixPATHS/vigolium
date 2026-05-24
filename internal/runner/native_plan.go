@@ -23,8 +23,8 @@ const (
 // rendered in --only/--skip validation error messages. Kept here so CLI and server
 // error messages don't drift when aliases change.
 const (
-	ValidOnlyPhasesDesc = "ingestion, discovery (deparos), spidering (spitolas), external-harvest, dynamic-assessment (dast, audit, assessment), known-issue-scan, extension (ext)"
-	ValidSkipPhasesDesc = "discovery (deparos), external-harvest, spidering (spitolas), dynamic-assessment (dast, audit, assessment), known-issue-scan"
+	ValidOnlyPhasesDesc = "ingestion, discovery (deparos), spidering (spitolas), external-harvest, dynamic-assessment (dast, audit, assessment), known-issue-scan (cve, kis), extension (ext)"
+	ValidSkipPhasesDesc = "discovery (deparos), external-harvest, spidering (spitolas), dynamic-assessment (dast, audit, assessment), known-issue-scan (cve, kis)"
 )
 
 type NativePhaseStep struct {
@@ -110,6 +110,8 @@ func NormalizeNativePhase(phase string) string {
 		return "extension"
 	case "audit", "dast", "assessment":
 		return "dynamic-assessment"
+	case "cve", "kis", "known-issues":
+		return "known-issue-scan"
 	default:
 		return phase
 	}

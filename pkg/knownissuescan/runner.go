@@ -2,11 +2,13 @@ package knownissuescan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/projectdiscovery/gologger"
@@ -25,20 +27,27 @@ import (
 
 // Config holds configuration for a known-issue scan.
 type Config struct {
-	Targets      []string                  // scheme://host:port URLs to scan
-	Concurrency  int                       // nuclei host concurrency (default: 5)
-	RateLimit    int                       // requests/sec (default: 150)
-	Tags         []string                  // template tags to include (empty = all)
-	ExcludeTags  []string                  // template tags to exclude
-	Severities   []string                  // filter by severity (empty = all)
-	TemplatesDir string                    // custom templates directory
-	Timeout      time.Duration             // max known-issue scan duration (default: 30m)
-	Headers      []string                  // custom headers
-	ProxyURL     string                    // proxy URL
-	OnResult     func(*output.ResultEvent) // callback per finding
-	Repository   *database.Repository      // for saving findings
-	ScanUUID     string
-	ProjectUUID  string
+	Targets      []string      // scheme://host:port URLs to scan
+	Concurrency  int           // nuclei host concurrency (default: 5)
+	RateLimit    int           // requests/sec (default: 150)
+	Tags         []string      // template tags to include (empty = all)
+	ExcludeTags  []string      // template tags to exclude
+	Severities   []string      // filter by severity (empty = all)
+	TemplatesDir string        // custom templates directory
+	Timeout      time.Duration // max known-issue scan duration (default: 30m)
+	// RequestTimeout bounds a single nuclei request (default: 10s). It also caps
+	// how long an in-flight request can keep the abandoned scan goroutine alive
+	// after the phase deadline fires (see Run's deadline path).
+	RequestTimeout time.Duration
+	// Retries is the nuclei per-request retry count (default: 1). Fewer retries
+	// shrink the post-deadline drain tail.
+	Retries     int
+	Headers     []string                  // custom headers
+	ProxyURL    string                    // proxy URL
+	OnResult    func(*output.ResultEvent) // callback per finding
+	Repository  *database.Repository      // for saving findings
+	ScanUUID    string
+	ProjectUUID string
 }
 
 // Run executes the known-issue scan using the nuclei Go library.
@@ -56,6 +65,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Minute
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 10 * time.Second
+	}
+	if cfg.Retries <= 0 {
+		cfg.Retries = 1
 	}
 
 	// Ensure nuclei templates are available before attempting to scan
@@ -92,7 +107,9 @@ func Run(ctx context.Context, cfg Config) error {
 		zap.Duration("timeout", cfg.Timeout),
 	)
 
-	// Create nuclei engine with timeout context
+	// Create nuclei engine with timeout context. NOTE: cancel() is deferred, but
+	// ne.Close() is NOT — its safety depends on the exit path (see below), so it
+	// is invoked explicitly per-path.
 	scanCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
@@ -100,14 +117,24 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("knownissuescan: failed to create nuclei engine: %w", err)
 	}
-	defer ne.Close()
 
 	// Load targets
 	ne.LoadTargets(cfg.Targets, false)
 
-	// Execute with callback
-	var findingCount int
-	err = ne.ExecuteCallbackWithCtx(scanCtx, func(event *nucleiOutput.ResultEvent) {
+	// done flips once Run has moved past the deadline. The callback checks it (and
+	// scanCtx.Err()) so the abandoned nuclei goroutine stops emitting findings /
+	// DB writes after we've returned. findingCount is atomic because nuclei fires
+	// the callback from worker goroutines while we read it from the main goroutine.
+	var done atomic.Bool
+	var findingCount atomic.Int64
+
+	callback := func(event *nucleiOutput.ResultEvent) {
+		// Stop persisting once the phase has moved past its deadline. This prevents
+		// the abandoned nuclei goroutine from writing findings (and racing a closed
+		// scan row) after Run has returned.
+		if done.Load() || scanCtx.Err() != nil {
+			return
+		}
 		// Only process genuine matches — nuclei fires the callback for all
 		// template evaluations, including non-matches.
 		if !event.MatcherStatus {
@@ -117,14 +144,16 @@ func Run(ctx context.Context, cfg Config) error {
 		result := convertResult(event)
 		result.ModuleType = database.ModuleTypeKnownIssueScan
 		result.FindingSource = database.FindingSourceKnownIssueScan
-		findingCount++
+		findingCount.Add(1)
 
 		// Invoke user callback
 		if cfg.OnResult != nil {
 			cfg.OnResult(result)
 		}
 
-		// Persist to database
+		// Persist to database. Use scanCtx (not the parent ctx) so a write that
+		// races the deadline fails fast on a cancelled context instead of landing
+		// in the finished phase's counters.
 		if cfg.Repository != nil {
 			var httpRecordUUIDs []string
 			if result.Request != "" {
@@ -132,24 +161,77 @@ func Run(ctx context.Context, cfg Config) error {
 					httpmsg.NewHttpRequest([]byte(result.Request)),
 					httpmsg.NewHttpResponse([]byte(result.Response)),
 				)
-				recordUUID, recErr := cfg.Repository.SaveRecord(ctx, fuzzedRR, "spa", cfg.ProjectUUID)
+				recordUUID, recErr := cfg.Repository.SaveRecord(scanCtx, fuzzedRR, "spa", cfg.ProjectUUID)
 				if recErr != nil {
 					zap.L().Debug("KnownIssueScan: failed to save http record", zap.Error(recErr))
 				} else {
 					httpRecordUUIDs = []string{recordUUID}
 				}
 			}
-			if saveErr := cfg.Repository.SaveFinding(ctx, result, httpRecordUUIDs, cfg.ScanUUID, cfg.ProjectUUID); saveErr != nil {
+			if saveErr := cfg.Repository.SaveFinding(scanCtx, result, httpRecordUUIDs, cfg.ScanUUID, cfg.ProjectUUID); saveErr != nil {
 				zap.L().Debug("KnownIssueScan: failed to save finding", zap.Error(saveErr))
 			}
 		}
-	})
-	if err != nil {
-		return fmt.Errorf("knownissuescan: execution failed: %w", err)
 	}
 
-	zap.L().Info("Known-issue scan completed", zap.Int("findings", findingCount))
+	// nuclei's ExecuteCallbackWithCtx blocks on its internal in-flight drain even
+	// after scanCtx is cancelled (it does <-wait(&wg) on ctx.Done()). Run it in our
+	// own goroutine and enforce cfg.Timeout / parent-cancel as a HARD wall-clock
+	// bound: return at the deadline instead of waiting for the drain.
+	var scanErr error
+	deadlineErr := runScanWithDeadline(scanCtx,
+		func() error { return ne.ExecuteCallbackWithCtx(scanCtx, callback) },
+		// onComplete: scan returned within budget — its goroutine is gone, so
+		// Close() is safe inline here. The scan's own error is captured for
+		// classification below.
+		func(e error) { scanErr = e; ne.Close() },
+		// onAbandon: detached cleanup. Runs only after the abandoned scan goroutine
+		// finally drains, so Close() never races a live scan. May never run if a
+		// no-deadline protocol read hangs (inherent nuclei limit) — but that no
+		// longer blocks the caller.
+		func() { ne.Close() },
+	)
+
+	if deadlineErr != nil {
+		// Deadline (or parent cancel) fired before the scan finished. The phase
+		// caller classifies this as a curtailment via ctx.Err().
+		done.Store(true)
+		zap.L().Warn("Known-issue scan curtailed at deadline; nuclei resource cleanup deferred to background",
+			zap.Int64("findings", findingCount.Load()),
+			zap.Error(deadlineErr))
+		return deadlineErr
+	}
+	if scanErr != nil {
+		// A clean in-budget curtailment (nuclei drained before its own deadline
+		// returned) is a curtailment, not a failure — surface it as the ctx error.
+		if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
+			zap.L().Info("Known-issue scan stopped at deadline", zap.Int64("findings", findingCount.Load()))
+			return scanErr
+		}
+		return fmt.Errorf("knownissuescan: execution failed: %w", scanErr)
+	}
+
+	zap.L().Info("Known-issue scan completed", zap.Int64("findings", findingCount.Load()))
 	return nil
+}
+
+// runScanWithDeadline runs scan() in a goroutine and returns as soon as either
+// the scan finishes OR ctx is done — it does NOT block on the scan's drain when
+// ctx fires first. On the completion path it calls onComplete(scanErr) inline
+// (Close is safe there) and returns nil. On the deadline path it returns
+// ctx.Err() immediately and runs onAbandon in a detached goroutine after scan()
+// eventually returns, so resource cleanup never races a still-running scan.
+func runScanWithDeadline(ctx context.Context, scan func() error, onComplete func(error), onAbandon func()) error {
+	scanErr := make(chan error, 1) // buffered: the scan goroutine's send never blocks
+	go func() { scanErr <- scan() }()
+	select {
+	case err := <-scanErr:
+		onComplete(err)
+		return nil
+	case <-ctx.Done():
+		go func() { <-scanErr; onAbandon() }()
+		return ctx.Err()
+	}
 }
 
 // buildEngineOptions constructs nuclei SDK options from known-issue scan config.
@@ -187,6 +269,23 @@ func buildEngineOptions(ctx context.Context, cfg Config, logger *gologger.Logger
 
 	// Rate limit
 	opts = append(opts, nuclei.WithGlobalRateLimitCtx(ctx, cfg.RateLimit, time.Second))
+
+	// Per-request network timeout and retry budget. nuclei cancellation is
+	// cooperative: when the phase deadline fires, in-flight requests run to their
+	// per-request timeout before the abandoned scan goroutine can drain. An explicit
+	// short Timeout (seconds) and low Retries bound that drain tail. NOTE: this
+	// cannot bound a genuinely no-deadline read (the SMB/JS leak class excluded via
+	// ExcludeProtocolTypes below) — for those the detached cleanup goroutine in Run
+	// may never finish, but it no longer blocks the caller.
+	reqTimeoutSecs := int(cfg.RequestTimeout / time.Second)
+	if reqTimeoutSecs < 1 {
+		reqTimeoutSecs = 1
+	}
+	opts = append(opts, nuclei.WithNetworkConfig(nuclei.NetworkConfig{
+		Timeout:      reqTimeoutSecs,
+		Retries:      cfg.Retries,
+		MaxHostError: 30, // skip persistently-failing hosts fast (nuclei raises this to concurrency if lower)
+	}))
 
 	// Concurrency
 	opts = append(opts, nuclei.WithConcurrency(nuclei.Concurrency{

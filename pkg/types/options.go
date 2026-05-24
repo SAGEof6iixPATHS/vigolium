@@ -117,6 +117,10 @@ type Options struct {
 	// Headers contains custom headers to include in all HTTP requests
 	Headers []string
 
+	// ScanMaxDuration caps total wall-clock time for the whole native scan
+	// (all phases combined). 0 = unbounded. Sourced from --scanning-max-duration.
+	ScanMaxDuration time.Duration
+
 	// Content discovery options
 	DiscoverEnabled     bool
 	DiscoverMaxDuration time.Duration
@@ -209,7 +213,7 @@ type Options struct {
 func DefaultOptions() *Options {
 	return &Options{
 		Concurrency:          50,
-		MaxPerHost:           20,
+		MaxPerHost:           50,
 		Timeout:              15 * time.Second,
 		Retries:              1,
 		MaxHostError:         30,

@@ -51,6 +51,20 @@ func (r *Runner) RunNativeScan() error {
 	defer close(r.done)
 	ctx := r.ctx
 
+	// Total scan budget: when --scanning-max-duration is set, bound the WHOLE scan
+	// (all phases combined). Each phase wraps this ctx with its own per-phase
+	// deadline via phaseDeadline, which keeps the earlier deadline — so phases can
+	// share and never exceed this total budget. End-of-scan DB bookkeeping below
+	// stays on r.ctx (the un-bounded parent) so the scan record is still finalized
+	// after the budget fires.
+	if r.options.ScanMaxDuration > 0 {
+		zap.L().Info("Total scan budget active — the whole scan is bounded by --scanning-max-duration; phases share it and remaining phases are skipped once it elapses",
+			zap.Duration("scan_max_duration", r.options.ScanMaxDuration))
+		var totalCancel context.CancelFunc
+		ctx, totalCancel = context.WithTimeout(ctx, r.options.ScanMaxDuration)
+		defer totalCancel()
+	}
+
 	infra, err := r.buildInfrastructure()
 	if err != nil {
 		return err
@@ -87,7 +101,9 @@ func (r *Runner) RunNativeScan() error {
 			if r.ctx.Err() != nil {
 				errMsg = "cancelled"
 			}
-			if completeErr := r.repository.CompleteScan(ctx, infra.scanUUID, errMsg); completeErr != nil {
+			// Write on r.ctx (un-bounded parent), not the total-budget-bounded ctx:
+			// a scan curtailed by --scanning-max-duration must still record completion.
+			if completeErr := r.repository.CompleteScan(r.ctx, infra.scanUUID, errMsg); completeErr != nil {
 				zap.L().Warn("Failed to complete scan record", zap.Error(completeErr))
 			}
 		}()
@@ -243,6 +259,15 @@ func (r *Runner) RunNativeScan() error {
 	for _, step := range plan.Steps {
 		if !step.Enabled {
 			continue
+		}
+		// Stop launching phases once the total scan budget (--scanning-max-duration)
+		// has elapsed. Mirrors the full-scan-on-receive loop guard above so a
+		// curtailed scan ends cleanly instead of starting phases that would
+		// immediately abort on the already-expired ctx.
+		if ctx.Err() != nil {
+			zap.L().Warn("Scan budget (scanning-max-duration) reached; skipping remaining phases",
+				zap.String("phase", string(step.Phase)))
+			break
 		}
 		if err := r.executeNativePhase(ctx, infra, step.Phase); err != nil {
 			return err
@@ -572,22 +597,13 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 		}
 	}
 
-	// bookkeepingCtx is the un-bounded parent context (still cancelled if the
-	// whole scan is cancelled). End-of-phase DB writes use it so progress counters
-	// still land when only the phase deadline — not the scan — has fired.
+	// bookkeepingCtx is the un-bounded parent context (still cancelled if the whole
+	// scan is cancelled). End-of-phase DB writes use it so progress counters still
+	// land when only a leg's deadline — not the scan — has fired. The Nuclei and
+	// Kingfisher legs below each derive their OWN max_duration budget from it (see
+	// the per-leg comments), so they are bounded independently but never exceed the
+	// overall scan budget.
 	bookkeepingCtx := ctx
-
-	// Enforce the known-issue-scan phase deadline across BOTH the Nuclei scan and
-	// the Kingfisher secret-scan batch below. knownissuescan.Run wraps its own
-	// ctx with cfg.Timeout, but runKingfisherBatch runs on the raw phase ctx — one
-	// binary invocation per response body in the DB. Without this wrap the
-	// Kingfisher loop lets total phase time blow past max_duration (mirrors the
-	// dynamic-assessment phase deadline wrap). The two legs share this single
-	// budget sequentially: a slow Nuclei run leaves Kingfisher less time (or none),
-	// which is surfaced as a curtailment notice rather than an error below.
-	var phaseCancel context.CancelFunc
-	ctx, phaseCancel = phaseDeadline(ctx, kisMaxDuration)
-	defer phaseCancel()
 	enrichTargets := true
 	if r.settings != nil {
 		enrichTargets = r.settings.KnownIssueScan.EnrichTargets
@@ -637,22 +653,33 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 		}
 	}
 
-	// Nuclei scan on distinct hosts. A ctx error means the phase max_duration
-	// (or the scan) elapsed — that is a curtailment, not a failure.
-	if err := r.runKnownIssueScan(ctx, onResult); err != nil {
-		if ctx.Err() != nil {
-			zap.L().Warn("KnownIssueScan: Nuclei scan stopped at phase max_duration", zap.Error(ctx.Err()))
+	// Nuclei scan on distinct hosts. It gets its OWN max_duration budget so that a
+	// long Nuclei run no longer starves the Kingfisher secret scan below — the two
+	// legs are bounded independently rather than sharing one budget. A ctx error
+	// means this leg's max_duration (or the overall scan) elapsed — that is a
+	// curtailment, not a failure.
+	nucleiCtx, nucleiCancel := phaseDeadline(ctx, kisMaxDuration)
+	defer nucleiCancel()
+	if err := r.runKnownIssueScan(nucleiCtx, onResult); err != nil {
+		if nucleiCtx.Err() != nil {
+			zap.L().Warn("KnownIssueScan: Nuclei scan stopped at phase max_duration", zap.Error(nucleiCtx.Err()))
 		} else {
 			zap.L().Error("KnownIssueScan: Nuclei scan failed", zap.Error(err))
 		}
 	}
 
-	// Kingfisher batch scan on all response bodies. Shares the phase budget with
-	// the Nuclei leg above, so a slow Nuclei run can leave it little or no time;
-	// distinguish that curtailment from a genuine scanner failure.
-	if err := r.runKingfisherBatch(ctx, infra, onResult); err != nil {
-		if ctx.Err() != nil {
-			zap.L().Warn("KnownIssueScan: Kingfisher secret scan curtailed before all response bodies were scanned — phase max_duration reached", zap.Error(ctx.Err()))
+	// Kingfisher batch scan on all response bodies. It gets a FRESH max_duration
+	// budget that starts now (derived from the parent ctx, so still bounded by the
+	// overall scan budget), so it always runs even when the Nuclei leg above was
+	// curtailed at its deadline. Kingfisher scans DB response bodies locally (no
+	// network) and normally finishes well within this budget. Worst-case phase
+	// wall-clock is ~2× max_duration, capped by the overall scan budget. A ctx error
+	// is a curtailment, distinct from a genuine scanner failure.
+	kingfisherCtx, kingfisherCancel := phaseDeadline(ctx, kisMaxDuration)
+	defer kingfisherCancel()
+	if err := r.runKingfisherBatch(kingfisherCtx, infra, onResult); err != nil {
+		if kingfisherCtx.Err() != nil {
+			zap.L().Warn("KnownIssueScan: Kingfisher secret scan curtailed before all response bodies were scanned — phase max_duration reached", zap.Error(kingfisherCtx.Err()))
 		} else {
 			zap.L().Error("KnownIssueScan: Kingfisher batch failed", zap.Error(err))
 		}
@@ -700,6 +727,15 @@ func (r *Runner) runKingfisherBatch(ctx context.Context, infra *phaseInfra, onRe
 	var cursor string
 	var totalFindings int
 	for {
+		// Break promptly when the phase/scan budget elapses. A single batch holds up
+		// to kingfisherBatchSize records, so without an inner-loop check below the
+		// per-record loop would scan every body before the next-batch fetch could
+		// observe cancellation. Returning ctx.Err() lets the caller log the
+		// secret-scan curtailment notice rather than treating it as a failure.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		records, err := r.repository.GetRecordsWithResponseBody(ctx, r.options.ProjectUUID, cursor, kingfisherBatchSize)
 		if err != nil {
 			return fmt.Errorf("kingfisher batch: failed to fetch records: %w", err)
@@ -710,6 +746,10 @@ func (r *Runner) runKingfisherBatch(ctx context.Context, infra *phaseInfra, onRe
 
 		for _, record := range records {
 			cursor = record.UUID
+
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 
 			// Filter by content type (reuse IsTextBasedMIME from secret_detect)
 			if !secret_detect.IsTextBasedMIME(record.ResponseContentType) {

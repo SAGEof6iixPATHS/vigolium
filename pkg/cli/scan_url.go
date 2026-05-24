@@ -606,6 +606,7 @@ func buildPhaseOptions(target string) *types.Options {
 // This enables full-pipeline phases (discover, spider, external-harvest, known-issue-scan)
 // from the lightweight scan-url and scan-request commands.
 func runPhaseMode(_ *httpmsg.HttpRequestResponse, target, _ string) error {
+	scanStart := time.Now()
 	opts := buildPhaseOptions(target)
 
 	// Load settings from config file
@@ -693,7 +694,7 @@ func runPhaseMode(_ *httpmsg.HttpRequestResponse, target, _ string) error {
 
 	if !opts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-		printScanCompletionSummary(repo)
+		printScanCompletionSummary(repo, time.Since(scanStart))
 	}
 
 	return nil

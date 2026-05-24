@@ -10,8 +10,13 @@ import (
 // These tests guard the per-phase max_duration enforcement. The original bug:
 // the known-issue-scan phase computed the right budget but only applied it to
 // one leg (Nuclei) while the Kingfisher leg ran unbounded, so the phase could
-// overrun max_duration. The fix routes every phase deadline through
-// phaseDeadline; these tests pin its behavior so the regression can't return.
+// overrun max_duration. The fix routes every phase deadline through phaseDeadline.
+//
+// known-issue-scan later moved its two legs from ONE shared budget to INDEPENDENT
+// per-leg budgets, so a Nuclei run that consumes its whole budget no longer starves
+// the Kingfisher secret scan (TestPhaseDeadline_IndependentLegsEachGetOwnBudget).
+// The shared-budget property still holds for phases that bound all their work under
+// a single deadline (TestPhaseDeadline_BoundsSequentialLegs).
 //
 // Durations are kept small but upper-bound tolerances are generous so the tests
 // stay deterministic on slow/loaded CI without false failures.
@@ -93,11 +98,12 @@ func TestPhaseDeadline_CapsToParentDeadline(t *testing.T) {
 	}
 }
 
-// TestPhaseDeadline_BoundsSequentialLegs directly encodes the known-issue-scan
-// regression: a phase runs two legs sequentially (Nuclei then Kingfisher) under
-// ONE shared deadline. The bug was that the second leg ran unbounded. Here the
-// first leg consumes the whole budget; a second leg that respects ctx must then
-// observe the deadline and return immediately instead of running unbounded.
+// TestPhaseDeadline_BoundsSequentialLegs pins the shared-budget property: when two
+// legs run sequentially under ONE shared deadline, a second leg that respects ctx
+// must observe the deadline the first leg exhausted and return immediately instead
+// of running unbounded. This is the contract for phases that bound all their work
+// under a single phaseDeadline (e.g. dynamic-assessment). known-issue-scan no longer
+// shares one budget between its legs — see TestPhaseDeadline_IndependentLegsEachGetOwnBudget.
 func TestPhaseDeadline_BoundsSequentialLegs(t *testing.T) {
 	const budget = 60 * time.Millisecond
 
@@ -121,6 +127,83 @@ func TestPhaseDeadline_BoundsSequentialLegs(t *testing.T) {
 	}
 	if elapsed > 25*time.Millisecond {
 		t.Fatalf("leg 2 ran %v past the exhausted phase deadline; expected immediate return", elapsed)
+	}
+}
+
+// TestTotalScanBudget_BoundsSequentialPhases encodes the --scanning-max-duration
+// fix: RunNativeScan wraps the root ctx in one total budget, then runs phases
+// sequentially, each deriving its own (larger) per-phase budget via phaseDeadline.
+// The bug was that without a total budget the per-phase budgets stacked
+// back-to-back (discovery + known-issue + ... could each get the full flag value),
+// so the whole scan ran far past the value the operator passed. Here three phases
+// each ask for far more than the total budget; the total elapsed must stay within
+// the budget, and phases launched after it is exhausted must return immediately
+// (modeling the phase-loop guard that skips the remaining phases).
+func TestTotalScanBudget_BoundsSequentialPhases(t *testing.T) {
+	const totalBudget = 80 * time.Millisecond
+	const perPhaseBudget = 10 * time.Second // each phase "wants" much more than the total
+
+	start := time.Now()
+
+	// Root scan ctx bounded by the total budget (the new wrap in RunNativeScan).
+	root, cancelRoot := context.WithTimeout(context.Background(), totalBudget)
+	defer cancelRoot()
+
+	var ran int
+	for phase := 0; phase < 3; phase++ {
+		// Phase-loop guard: stop launching phases once the budget has elapsed.
+		if root.Err() != nil {
+			break
+		}
+		ran++
+
+		phaseCtx, cancel := phaseDeadline(root, perPhaseBudget)
+		// A phase that honors ctx runs until the (total-clamped) deadline fires.
+		_ = runUntilCtxDone(phaseCtx)
+		cancel()
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > totalBudget+500*time.Millisecond {
+		t.Fatalf("total scan ran %v, exceeding the ~%v total budget — phases stacked past the cap", elapsed, totalBudget)
+	}
+	if ran == 3 {
+		t.Fatal("all 3 phases ran to their per-phase deadline; the total budget did not curtail later phases")
+	}
+}
+
+// TestPhaseDeadline_IndependentLegsEachGetOwnBudget encodes the known-issue-scan
+// design after the Kingfisher-starvation fix: the Nuclei and Kingfisher legs each
+// derive their OWN budget from the parent ctx instead of sharing one, so a first
+// leg that exhausts its entire budget does NOT starve the second leg — the second
+// leg starts fresh and runs for its own budget. (Each leg is still capped by the
+// parent/overall-scan deadline; that clamp is covered by
+// TestPhaseDeadline_CapsToParentDeadline.)
+func TestPhaseDeadline_IndependentLegsEachGetOwnBudget(t *testing.T) {
+	const budget = 60 * time.Millisecond
+
+	parent := context.Background()
+
+	// Leg 1 (Nuclei) gets its own budget and runs until it is exhausted.
+	leg1Ctx, cancel1 := phaseDeadline(parent, budget)
+	defer cancel1()
+	if leg1 := runUntilCtxDone(leg1Ctx); !errors.Is(leg1, context.DeadlineExceeded) {
+		t.Fatalf("leg 1 ended with %v, want DeadlineExceeded", leg1)
+	}
+
+	// Leg 2 (Kingfisher) gets a FRESH budget from the same parent. It must NOT be
+	// curtailed by leg 1's exhausted deadline — it should run for ~its own budget.
+	leg2Ctx, cancel2 := phaseDeadline(parent, budget)
+	defer cancel2()
+	start := time.Now()
+	leg2 := runUntilCtxDone(leg2Ctx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(leg2, context.DeadlineExceeded) {
+		t.Fatalf("leg 2 ended with %v, want DeadlineExceeded (it should run on its own budget)", leg2)
+	}
+	if elapsed < budget/2 {
+		t.Fatalf("leg 2 returned after only %v; it was starved by leg 1 instead of getting its own budget", elapsed)
 	}
 }
 

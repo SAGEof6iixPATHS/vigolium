@@ -195,7 +195,7 @@ func TestDefaultScanningPaceConfig(t *testing.T) {
 		factor float64
 	}{
 		{"discovery", 0.5},
-		{"known-issue-scan", 1.0},
+		{"known-issue-scan", 0.5},
 		{"spidering", 0.1},
 		{"external_harvester", 0.1},
 		{"dynamic-assessment", 1.0},
@@ -222,7 +222,7 @@ func TestDefaultPace_EveryPhaseHasFiniteBudget(t *testing.T) {
 	want := map[string]time.Duration{
 		"discovery":          22*time.Minute + 30*time.Second, // 45m * 0.5
 		"spidering":          4*time.Minute + 30*time.Second,  // 45m * 0.1
-		"known-issue-scan":   45 * time.Minute,                // 45m * 1.0
+		"known-issue-scan":   22*time.Minute + 30*time.Second, // 45m * 0.5
 		"external_harvester": 4*time.Minute + 30*time.Second,  // 45m * 0.1
 		"dynamic-assessment": 45 * time.Minute,                // 45m * 1.0
 	}

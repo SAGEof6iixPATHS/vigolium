@@ -20,6 +20,10 @@ func TestNormalizeNativePhase_Aliases(t *testing.T) {
 		{"assessment", "dynamic-assessment"},
 		{"dynamic-assessment", "dynamic-assessment"},
 		{"discovery", "discovery"},
+		{"cve", "known-issue-scan"},
+		{"kis", "known-issue-scan"},
+		{"known-issues", "known-issue-scan"},
+		{"known-issue-scan", "known-issue-scan"},
 		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
@@ -109,6 +113,26 @@ func TestApplyNativePhaseSelection_OnlyPhase(t *testing.T) {
 				onlyPhase:             "discovery,spidering",
 				discoverEnabled:       true,
 				spideringEnabled:      true,
+				skipDynamicAssessment: true,
+			},
+		},
+		{
+			name:  "cve alias resolves to known-issue-scan",
+			input: "cve",
+			want: want{
+				onlyPhase:             "known-issue-scan",
+				knownIssue:            true,
+				skipIngestion:         true,
+				skipDynamicAssessment: true,
+			},
+		},
+		{
+			name:  "kis alias resolves to known-issue-scan",
+			input: "kis",
+			want: want{
+				onlyPhase:             "known-issue-scan",
+				knownIssue:            true,
+				skipIngestion:         true,
 				skipDynamicAssessment: true,
 			},
 		},

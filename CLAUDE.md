@@ -118,7 +118,7 @@ Prompt templates are Markdown files with YAML frontmatter stored in `~/.vigolium
 
 ### Phase Aliases
 
-Scan phases accept aliases: `deparos` = `discovery`, `discover` = `discovery`, `spitolas` = `spidering`, `ext` = `extension`, `audit`/`dast`/`assessment` = `dynamic-assessment`. The canonical name for the module-based vulnerability scanning phase is `dynamic-assessment` (formerly `audit`). These work with `--only` and `--skip` flags.
+Scan phases accept aliases: `deparos` = `discovery`, `discover` = `discovery`, `spitolas` = `spidering`, `ext` = `extension`, `audit`/`dast`/`assessment` = `dynamic-assessment`, `cve`/`kis`/`known-issues` = `known-issue-scan`. The canonical name for the module-based vulnerability scanning phase is `dynamic-assessment` (formerly `audit`). These work with `--only` and `--skip` flags (and as the `vigolium run <phase>` arg, e.g. `vigolium run cve`).
 
 ### Output Formats
 

@@ -55,11 +55,11 @@ func DefaultScanningPaceConfig() *ScanningPaceConfig {
 	return &ScanningPaceConfig{
 		Concurrency: 50,
 		RateLimit:   100,
-		MaxPerHost:  20,
+		MaxPerHost:  50,
 		MaxDuration: "45m",
 
 		Discovery:         PhasePace{DurationFactor: 0.5},
-		KnownIssueScan:    PhasePace{DurationFactor: 1.0},
+		KnownIssueScan:    PhasePace{DurationFactor: 0.5},
 		Spidering:         PhasePace{DurationFactor: 0.1},
 		ExternalHarvester: PhasePace{DurationFactor: 0.1},
 		DynamicAssessment: PhasePace{DurationFactor: 1.0, ParallelPassive: boolPtr(true), FeedbackDrainTimeout: "500ms"},

@@ -316,8 +316,13 @@ scanning_pace:
   ## Common defaults (inherited by all phases unless overridden)
   concurrency: 50        # Worker/thread count
   rate_limit: 100        # Requests/sec (applies to KnownIssueScan currently)
-  max_per_host: 20        # Per-host concurrency cap
+  max_per_host: 50        # Per-host concurrency cap
   max_duration: 1h       # Base duration for all phases (per-phase factors scale this)
+  # NOTE: the --scanning-max-duration CLI flag additionally caps TOTAL scan
+  # wall-clock time (all phases combined) at the value passed, so multi-phase
+  # scans can't run past it; the per-phase factors then distribute that budget
+  # across phases instead of stacking sequentially. The YAML max_duration above
+  # is only the per-phase base and does not impose a total cap on its own.
 
   # Per-phase overrides (only set fields override common values)
   # Factors scale the common value (e.g. duration_factor: 2.0 = 2x base max_duration).
@@ -328,7 +333,7 @@ scanning_pace:
   #   max_duration: 1h
     duration_factor: 0.5          # 0.5x base → 22m30s
   known_issue_scan:
-    duration_factor: 1.0          # 1x base → 45m
+    duration_factor: 0.5          # 0.5x base → 30m
   spidering:
     duration_factor: 0.1          # 0.1x base → 4m30s
   external_harvester:

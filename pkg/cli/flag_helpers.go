@@ -31,7 +31,7 @@ func registerHTTPClientFlags(flags *pflag.FlagSet) {
 	flags.DurationVar(&globalTimeout, "timeout", 15*time.Second, "HTTP request timeout (e.g. 30s, 1m, 2h)")
 	flags.IntVarP(&globalConcurrency, "concurrency", "c", 50, "Number of concurrent scan workers")
 	flags.IntVarP(&globalRateLimit, "rate-limit", "r", 100, "Maximum HTTP requests per second")
-	flags.IntVar(&globalMaxPerHost, "max-per-host", 30, "Maximum concurrent requests allowed per host")
+	flags.IntVar(&globalMaxPerHost, "max-per-host", 50, "Maximum concurrent requests allowed per host")
 	flags.IntVar(&globalMaxHostError, "max-host-error", 30, "Skip host after reaching this many consecutive errors")
 	flags.IntVar(&globalMaxFindingsPerModule, "max-findings-per-module", 10, "Stop reporting after N findings per module (0 = unlimited)")
 	flags.BoolVar(&globalNoClustering, "no-clustering", false, "Disable deduplication of identical concurrent HTTP requests")

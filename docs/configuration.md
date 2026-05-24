@@ -126,7 +126,7 @@ scanning_pace:
   concurrency: 50          # global worker count
   rate_limit: 100          # max requests/sec across all hosts
   max_per_host: 10         # max concurrent requests per host
-  max_duration: 2h         # global time cap for a scan phase
+  max_duration: 2h         # per-phase base duration (each phase scales it by its duration_factor)
 
   # Per-phase overrides (zero = inherit from common):
   discovery:
@@ -145,6 +145,14 @@ scanning_pace:
     parallel_passive: true         # run passive modules in parallel
     feedback_drain_timeout: 500ms  # wait for feedback loop items
 ```
+
+> **Total scan cap (CLI):** `max_duration` above is only the per-phase base — on its
+> own it does not bound total scan time, so back-to-back phases can sum well past it.
+> The `--scanning-max-duration` CLI flag additionally caps the **total** wall-clock
+> time of the whole scan at the value you pass: the per-phase `duration_factor`s then
+> distribute that budget across phases (and remaining phases are skipped once it
+> elapses) instead of each phase getting the full value sequentially. A single-phase
+> run (e.g. `vigolium run known-issue-scan`) therefore matches the value exactly.
 
 ### `discovery`
 
@@ -386,6 +394,12 @@ known_issue_scan:
   templates_dir: ""                # custom templates path
   enrich_targets: true             # feed discovered paths into known-issue scan
 ```
+
+> **Single-phase runs sweep all severities:** the balanced default narrows
+> `severities` to `critical,high`. When known-issue-scan is the **only** phase
+> requested (`vigolium run known-issue-scan` or `--only known-issue-scan`), Vigolium
+> treats it as a focused full scan and widens `severities` to all levels for that
+> run, printing a one-line notice. Pass `--known-issue-scan-severities` to override.
 
 ### `mutation_strategy`
 

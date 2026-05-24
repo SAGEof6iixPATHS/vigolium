@@ -55,6 +55,38 @@ func init() {
 	registerNativeScanFlags(flags, true)
 }
 
+// allKnownIssueScanSeverities is the full nuclei severity set. A known-issue-scan
+// run launched in isolation widens to this so a focused single-phase run is
+// exhaustive rather than limited to the balanced default (critical+high).
+var allKnownIssueScanSeverities = []string{"critical", "high", "medium", "low", "info"}
+
+// shouldWidenKnownIssueScanSeverities reports whether a known-issue-scan launched
+// as the only phase (`vigolium run known-issue-scan` / `--only known-issue-scan`)
+// should have its severity filter widened to all levels. Running a single phase on
+// its own is normally meant to be an exhaustive sweep, so the balanced default of
+// critical+high would silently drop medium/low/info findings. Returns false when
+// the user explicitly set --known-issue-scan-severities (their choice wins), when
+// any phase other than known-issue-scan is also selected, or when the configured
+// set is already empty (= all) or already covers every level.
+func shouldWidenKnownIssueScanSeverities(onlyPhase string, severitiesExplicit bool, configured []string) bool {
+	if onlyPhase != string(runner.PhaseKnownIssueScan) || severitiesExplicit {
+		return false
+	}
+	if len(configured) == 0 {
+		return false // empty = already all severities
+	}
+	have := make(map[string]bool, len(configured))
+	for _, s := range configured {
+		have[strings.ToLower(strings.TrimSpace(s))] = true
+	}
+	for _, s := range allKnownIssueScanSeverities {
+		if !have[s] {
+			return true // missing at least one level → widen to all
+		}
+	}
+	return false // already covers every level
+}
+
 func runScanCmd(cmd *cobra.Command, args []string) error {
 	defer syncLogger()
 
@@ -258,9 +290,14 @@ func runScanCmd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("multiple --format values require -o/--output to specify the base output path")
 	}
 
-	// Override scanning_pace.max_duration if --scanning-max-duration flag is set
+	// Override scanning_pace.max_duration if --scanning-max-duration flag is set.
+	// This value plays two roles: it seeds the per-phase base (each phase scales
+	// it by its duration_factor) AND caps total wall-clock time for the whole
+	// scan via Options.ScanMaxDuration, so the per-phase factors distribute time
+	// within the total budget rather than stacking sequentially past it.
 	if cmd.Flags().Changed("scanning-max-duration") && globalScanningMaxDuration > 0 {
 		settings.ScanningPace.MaxDuration = globalScanningMaxDuration.String()
+		scanOpts.ScanMaxDuration = globalScanningMaxDuration
 	}
 
 	// Validate and apply scanning_pace centralized speed control
@@ -305,6 +342,20 @@ func runScanCmd(cmd *cobra.Command, args []string) error {
 		}
 		if cmd.Flags().Changed("known-issue-scan-severities") {
 			settings.KnownIssueScan.Severities = scanOpts.KnownIssueScanSeverities
+		}
+		// When known-issue-scan is the only phase requested, treat it as a focused
+		// full scan and widen severities to all levels (unless the user pinned them
+		// with --known-issue-scan-severities). The balanced default ships
+		// critical+high, which would silently drop medium/low/info on an isolated run.
+		if shouldWidenKnownIssueScanSeverities(scanOpts.OnlyPhase, cmd.Flags().Changed("known-issue-scan-severities"), settings.KnownIssueScan.Severities) {
+			prev := strings.Join(settings.KnownIssueScan.Severities, ",")
+			settings.KnownIssueScan.Severities = append([]string(nil), allKnownIssueScanSeverities...)
+			if !scanOpts.Silent {
+				fmt.Fprintf(os.Stderr, "  %s %s\n",
+					terminal.TipPrefix(),
+					terminal.Gray(fmt.Sprintf("running only known-issue-scan — adjusted known_issue_scan.severities from %s to all severities (%s) for this scan",
+						prev, strings.Join(allKnownIssueScanSeverities, ","))))
+			}
 		}
 		if cmd.Flags().Changed("known-issue-scan-templates-dir") {
 			settings.KnownIssueScan.TemplatesDir = scanOpts.KnownIssueScanTemplatesDir
@@ -362,6 +413,11 @@ func runScanCmd(cmd *cobra.Command, args []string) error {
 // scanOpts. In stateless mode it allocates a fresh temporary SQLite database
 // and tears it down on return so callers can invoke it once per target.
 func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyName string) error {
+	// Wall-clock anchor for the whole scan pass, surfaced in the completion
+	// summary. Captured before DB setup so it reflects total time, not just the
+	// scanning legs.
+	scanStart := time.Now()
+
 	// Stateless mode: create a temporary SQLite database for this run only.
 	var statelessDBPath string
 	if scanOpts.Stateless {
@@ -448,7 +504,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 	// If -i was explicitly provided, use two-phase ingest-then-scan
 	hasInputFile := globalInput != "" && globalInput != "-"
 	if hasInputFile {
-		return runScanWithIngest(settings, db, repo)
+		return runScanWithIngest(settings, db, repo, scanStart)
 	}
 
 	// If no targets/input/stdin, fall back to scanning DB records
@@ -456,7 +512,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 	hasTargetFile := scanOpts.TargetsFilePath != ""
 	hasStdin := scanOpts.Stdin
 	if !hasTargets && !hasTargetFile && !hasStdin {
-		return runDBScan(settings, db, repo)
+		return runDBScan(settings, db, repo, scanStart)
 	}
 
 	// Smart stdin detection: if stdin is present and -I was not explicitly set,
@@ -500,7 +556,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 
 				if !scanOpts.Silent {
 					fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-					printScanCompletionSummary(repo)
+					printScanCompletionSummary(repo, time.Since(scanStart))
 				}
 				return nil
 			}
@@ -545,7 +601,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 	// Print completion message with summary stats
 	if !scanOpts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-		printScanCompletionSummary(repo)
+		printScanCompletionSummary(repo, time.Since(scanStart))
 	}
 
 	return nil
@@ -664,7 +720,7 @@ func perTargetSuffix(target string, idx int) string {
 // runScanWithIngest delegates to the Runner's 3-phase pipeline when -i is provided.
 // The Runner's Phase 1 ingests the input file, Phase 2 runs KnownIssueScan if enabled,
 // and Phase 3 scans from DB with all modules.
-func runScanWithIngest(settings *config.Settings, db *database.DB, repo *database.Repository) error {
+func runScanWithIngest(settings *config.Settings, db *database.DB, repo *database.Repository, scanStart time.Time) error {
 	// Auto-detect format from file extension
 	inputFormat := globalInputMode
 	if inputFormat == "urls" {
@@ -735,7 +791,7 @@ func runScanWithIngest(settings *config.Settings, db *database.DB, repo *databas
 
 	if !scanOpts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-		printScanCompletionSummary(repo)
+		printScanCompletionSummary(repo, time.Since(scanStart))
 	}
 
 	return nil
@@ -744,7 +800,7 @@ func runScanWithIngest(settings *config.Settings, db *database.DB, repo *databas
 // runDBScan scans records already in the database (no explicit targets).
 // Delegates to RunNativeScan(): Phase 1 is a no-op (empty source),
 // Phase 2 runs KnownIssueScan if enabled, Phase 3 reads existing DB records.
-func runDBScan(settings *config.Settings, db *database.DB, repo *database.Repository) error {
+func runDBScan(settings *config.Settings, db *database.DB, repo *database.Repository, scanStart time.Time) error {
 	// Create Runner with an empty input source — Phase 1 becomes a no-op
 	scanRunner, err := runner.NewWithInputSource(scanOpts, &emptySource{})
 	if err != nil {
@@ -767,7 +823,7 @@ func runDBScan(settings *config.Settings, db *database.DB, repo *database.Reposi
 
 	if !scanOpts.Silent {
 		fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Aqua(terminal.SymbolSparkle), terminal.BoldAqua("Native scan completed"))
-		printScanCompletionSummary(repo)
+		printScanCompletionSummary(repo, time.Since(scanStart))
 	}
 
 	return nil
@@ -1283,8 +1339,9 @@ func countExtensionFiles(cfg *config.ExtensionsConfig) int {
 	return count
 }
 
-// printScanCompletionSummary prints a compact summary of ingested records and findings after scan completion.
-func printScanCompletionSummary(repo *database.Repository) {
+// printScanCompletionSummary prints a compact summary of ingested records,
+// findings, and total wall-clock duration after scan completion.
+func printScanCompletionSummary(repo *database.Repository, elapsed time.Duration) {
 	if repo == nil {
 		return
 	}
@@ -1323,6 +1380,15 @@ func printScanCompletionSummary(repo *database.Repository) {
 	fmt.Fprintf(os.Stderr, "  %s Records: %s http records ingested\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.Cyan(fmt.Sprintf("%d", recordCount)))
+
+	// Total scan duration always prints last, after Records and the Findings line
+	// (whichever branch runs below). Registered here — not at function entry — so
+	// the rare DB-error early returns above don't emit a lone Duration line.
+	defer func() {
+		fmt.Fprintf(os.Stderr, "  %s Duration: %s\n",
+			terminal.Purple(terminal.SymbolInfo),
+			terminal.Gray(elapsed.Round(time.Second).String()))
+	}()
 
 	if totalFindings == 0 {
 		fmt.Fprintf(os.Stderr, "  %s Findings: %s\n",

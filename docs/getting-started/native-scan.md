@@ -160,7 +160,7 @@ vigolium scan --stateless -i nuclei.jsonl -I nuclei --format jsonl -o results
 ## Tuning a scan
 
 ```bash
-# Speed knobs — defaults: -c 50, -r 100 req/s, --max-per-host 30, --timeout 15s
+# Speed knobs — defaults: -c 50, -r 100 req/s, --max-per-host 50, --timeout 15s
 vigolium scan --stateless -t https://example.com \
   -c 100 -r 200 --max-per-host 10 --timeout 30s \
   --format jsonl -o results
